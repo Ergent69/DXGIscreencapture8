@@ -75,7 +75,6 @@ using Microsoft::WRL::ComPtr;
 // --- КОНСТАНТЫ И ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 const int WINDOW_WIDTH = 1000;
 const int WINDOW_HEIGHT = 800;
-
 const int TOP_PANEL_HEIGHT = 60;
 const int CONSOLE_HEIGHT = 140;
 
@@ -88,6 +87,9 @@ const int UDP_PACKET_SIZE = 1400; // MTU safe size
 #define ID_BTN_APPLY 103
 #define ID_CONSOLE_BOX 104
 #define ID_COMBO_CODEC 105
+// Новые ID для чекбоксов
+#define ID_CHK_SHOW 106
+#define ID_CHK_STREAM 107
 
 // Структура для кодеков
 struct CodecOption {
@@ -107,6 +109,10 @@ const std::vector<int> AVAILABLE_FPS = { 1, 15, 30, 60, 90, 120, 144, 165 };
 std::atomic<bool> g_Running(true);
 std::atomic<bool> g_RestartRequested(false);
 
+// Глобальные флаги для тумблеров (по дефолту выключены)
+std::atomic<bool> g_IsShowStream(false);
+std::atomic<bool> g_IsStreamNetwork(false);
+
 HWND g_hMainWindow = nullptr;
 HWND g_hVideoWindow = nullptr;
 HWND g_hConsoleWindow = nullptr;
@@ -114,6 +120,8 @@ HWND g_hEditRes = nullptr;
 HWND g_hComboFps = nullptr;
 HWND g_hBtnApply = nullptr;
 HWND g_hComboCodec = nullptr;
+HWND g_hChkShow = nullptr;
+HWND g_hChkStream = nullptr;
 
 HANDLE g_hJob = nullptr;
 SOCKET g_UdpSocket = INVALID_SOCKET;
@@ -136,7 +144,6 @@ private:
     std::mutex m;
     std::condition_variable cv;
     std::atomic<bool> finished;
-
 public:
     PacketQueue() : finished(false) {}
 
@@ -183,7 +190,6 @@ public:
 void InitNetwork() {
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
-
     g_UdpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_UdpSocket != INVALID_SOCKET) {
         BOOL broadcast = TRUE;
@@ -200,8 +206,10 @@ void InitNetwork() {
 }
 
 void SendUdpData(const uint8_t* data, int size) {
-    if (g_UdpSocket == INVALID_SOCKET) return;
+    // Если трансляция выключена - не отправляем ничего
+    if (!g_IsStreamNetwork) return;
 
+    if (g_UdpSocket == INVALID_SOCKET) return;
     int sent = 0;
     while (sent < size) {
         int chunkSize = std::min(UDP_PACKET_SIZE, size - sent);
@@ -225,11 +233,9 @@ void UpdateVideoLayout(int contentW, int contentH) {
     int availH = (rcMain.bottom - rcMain.top) - startY;
 
     if (availH <= 0) return;
-
     float scaleX = (float)availW / contentW;
     float scaleY = (float)availH / contentH;
     float scale = std::min(scaleX, scaleY);
-
     int newW = (int)(contentW * scale);
     int newH = (int)(contentH * scale);
 
@@ -255,7 +261,7 @@ const char* HLSL_NV12_TO_RGB = R"(
         uint width, height;
         OutputRGB.GetDimensions(width, height);
         if (pos.x >= width || pos.y >= height) return;
-
+  
         float Y = InputY[uint2(pos.x, pos.y)];
         float2 UV = InputUV[uint2(pos.x / 2, pos.y / 2)];
         
@@ -269,7 +275,6 @@ const char* HLSL_NV12_TO_RGB = R"(
         OutputRGB[pos] = float4(r, g, b, 1.0f);
     }
 )";
-
 // 2. RESIZE SHADER (Для DXGI режима) - Легкий Nearest Neighbor
 const char* HLSL_RESIZE = R"(
     Texture2D<float4> Input : register(t0);
@@ -293,7 +298,6 @@ const char* HLSL_RESIZE = R"(
         Output[id.xy] = Input[uint2(sx, sy)];
     }
 )";
-
 #define ALIGN_32(x) (((x) + 31) & ~31)
 
 struct ResizeParams {
@@ -307,7 +311,6 @@ class D3DRenderer {
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
     ComPtr<IDXGISwapChain1> m_swapChain;
-
     // OBS Mode
     ComPtr<ID3D11ComputeShader> m_csNv12ToRgb;
     ComPtr<ID3D11Texture2D> m_workTexture; // Используется и как буфер для NV12
@@ -319,7 +322,6 @@ class D3DRenderer {
     ComPtr<ID3D11Texture2D> m_captureCopyTexture; // Копия захваченного кадра (если нужен формат)
 
     ComPtr<ID3D11Texture2D> m_stagingTexture;
-
     // Software fallback
     struct SwsContext* m_swsCtx = nullptr;
     int m_swsWidth = 0;
@@ -331,7 +333,6 @@ class D3DRenderer {
     int m_width = 0, m_height = 0; // Текущий размер окна (BackBuffer)
     HWND m_hwndVideo;
     HWND m_hwndMain;
-
 public:
     D3DRenderer(HWND hVideo, HWND hMain) : m_hwndVideo(hVideo), m_hwndMain(hMain) {
         InitD3D(hVideo);
@@ -380,7 +381,6 @@ public:
     // --- GPU DOWNSCALE & SEND (DXGI MODE) ---
     void ProcessDXGIFrame(ID3D11Texture2D* srcTexture, int targetW, int targetH) {
         if (!srcTexture) return;
-
         D3D11_TEXTURE2D_DESC srcDesc;
         srcTexture->GetDesc(&srcDesc);
 
@@ -388,9 +388,7 @@ public:
 
         // 1. Если размеры не совпадают - делаем ресайз на GPU
         if (srcDesc.Width != (UINT)targetW || srcDesc.Height != (UINT)targetH) {
-
             EnsureTexture(m_scaledTexture, targetW, targetH, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-
             // Если исходная текстура не имеет флага BIND_SHADER_RESOURCE, копируем её
             if (!(srcDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
                 EnsureTexture(m_captureCopyTexture, srcDesc.Width, srcDesc.Height, srcDesc.Format, D3D11_BIND_SHADER_RESOURCE);
@@ -403,30 +401,30 @@ public:
             texToProcess = m_scaledTexture.Get();
         }
 
-        // 2. Рендерим в локальное окно (превью)
-        // Для превью нужно скопировать в BackBuffer. 
-        // BackBuffer имеет размер окна, texToProcess имеет целевой размер (user resolution).
-        // Если user resolution != window size, SwapChain сам растянет при Present,
-        // но нам нужно скопировать. 
-        // ВАЖНО: Мы ресайзим BackBuffer под текущую текстуру для корректного отображения.
-        ResizeSwapChain(targetW, targetH);
+        // 2. Рендерим в локальное окно (превью), ТОЛЬКО если включен тумблер
+        if (g_IsShowStream) {
+            ResizeSwapChain(targetW, targetH);
+            ComPtr<ID3D11Texture2D> backBuffer;
+            m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
+            m_context->CopyResource(backBuffer.Get(), texToProcess);
+            m_swapChain->Present(0, 0);
+        }
 
-        ComPtr<ID3D11Texture2D> backBuffer;
-        m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
-        m_context->CopyResource(backBuffer.Get(), texToProcess);
-        m_swapChain->Present(0, 0);
-
-        // 3. Отправляем по UDP (читаем из GPU)
-        SendTextureOverUDP(texToProcess, targetW, targetH);
+        // 3. Отправляем по UDP (читаем из GPU), ТОЛЬКО если включен тумблер
+        if (g_IsStreamNetwork) {
+            SendTextureOverUDP(texToProcess, targetW, targetH);
+        }
     }
 
     // --- OBS MODE RENDER ---
     void RenderFrame(AVFrame* frame) {
         if (!frame || !m_swapChain) return;
 
+        // Если отображение выключено, ничего не рендерим в окно
+        if (!g_IsShowStream) return;
+
         // В режиме OBS мы подгоняем окно под размер входящего видео
         ResizeSwapChain(frame->width, frame->height);
-
         if (frame->format == AV_PIX_FMT_D3D11) {
             ID3D11Texture2D* srcTexture = (ID3D11Texture2D*)frame->data[0];
             int srcIndex = (intptr_t)frame->data[1];
@@ -464,17 +462,14 @@ private:
         // Setup UAV (Output)
         ComPtr<ID3D11UnorderedAccessView> uav;
         m_device->CreateUnorderedAccessView(output, nullptr, &uav);
-
         m_context->CSSetShader(m_csResize.Get(), nullptr, 0);
         m_context->CSSetConstantBuffers(0, 1, m_cbResizeParams.GetAddressOf());
         m_context->CSSetShaderResources(0, 1, srv.GetAddressOf());
         m_context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
-
         // Dispatch
         UINT threadsX = (dstW + 15) / 16;
         UINT threadsY = (dstH + 15) / 16;
         m_context->Dispatch(threadsX, threadsY, 1);
-
         // Cleanup
         ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
         m_context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
@@ -490,13 +485,35 @@ private:
         HRESULT hr = m_context->Map(m_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
         if (SUCCEEDED(hr)) {
             uint8_t* ptr = (uint8_t*)mapped.pData;
-            int bytesPerLine = w * 4; // BGRA 
 
-            // Если Pitch совпадает с шириной, можно слать блоками больше
+            // КОНВЕРТАЦИЯ В 24-BIT RGB (24 bits per pixel)
+            // Исходный формат: BGRA (32 бита)
+            // Целевой: RGB (24 бита)
+
+            // Выделяем буфер под RGB
+            std::vector<uint8_t> rgbBuffer;
+            rgbBuffer.resize(w * h * 3);
+
             for (int y = 0; y < h; y++) {
-                SendUdpData(ptr, bytesPerLine);
-                ptr += mapped.RowPitch;
+                uint8_t* rowSrc = ptr + y * mapped.RowPitch;
+                uint8_t* rowDst = rgbBuffer.data() + y * w * 3;
+
+                for (int x = 0; x < w; x++) {
+                    // BGRA -> RGB
+                    // [0]=B, [1]=G, [2]=R, [3]=A
+                    uint8_t b = rowSrc[x * 4 + 0];
+                    uint8_t g = rowSrc[x * 4 + 1];
+                    uint8_t r = rowSrc[x * 4 + 2];
+
+                    rowDst[x * 3 + 0] = r;
+                    rowDst[x * 3 + 1] = g;
+                    rowDst[x * 3 + 2] = b;
+                }
             }
+
+            // Отправляем конвертированный буфер
+            SendUdpData(rgbBuffer.data(), (int)rgbBuffer.size());
+
             m_context->Unmap(m_stagingTexture.Get(), 0);
         }
     }
@@ -542,7 +559,6 @@ private:
         ComPtr<ID3D11Device3> device3;
         m_device.As(&device3);
         if (!device3) return;
-
         D3D11_SHADER_RESOURCE_VIEW_DESC1 srvDesc1 = {};
         srvDesc1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc1.Texture2D.MipLevels = 1;
@@ -557,16 +573,13 @@ private:
         srvDesc1.Texture2D.PlaneSlice = 1;
         ComPtr<ID3D11ShaderResourceView1> uvSRV;
         device3->CreateShaderResourceView1(m_workTexture.Get(), &srvDesc1, &uvSRV);
-
         if (!ySRV || !uvSRV) return;
 
         ID3D11ShaderResourceView* inputSRVs[] = { ySRV.Get(), uvSRV.Get() };
         m_context->CSSetShader(m_csNv12ToRgb.Get(), nullptr, 0);
         m_context->CSSetShaderResources(0, 2, inputSRVs);
-
         ID3D11UnorderedAccessView* outputUAVs[] = { backBufferUAV.Get() };
         m_context->CSSetUnorderedAccessViews(0, 1, outputUAVs, nullptr);
-
         m_context->Dispatch((m_width + 7) / 8, (m_height + 7) / 8, 1);
 
         ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
@@ -615,7 +628,6 @@ private:
 
         ComPtr<IDXGIFactory2> factory;
         CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&factory);
-
         DXGI_SWAP_CHAIN_DESC1 scDesc = {};
         scDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         scDesc.SampleDesc.Count = 1;
@@ -647,7 +659,6 @@ private:
         m_device->CreateBuffer(&bd, nullptr, &m_cbResizeParams);
     }
 };
-
 // ==========================================
 // ЛОГИКА КОНФИГА
 // ==========================================
@@ -660,7 +671,6 @@ void ModifyBasicIni(int width, int height, int fps, int codecIndex) {
     fs::path iniPath = exeDir / "config" / "obs-studio" / "basic" / "profiles" / "Untitled" / "basic.ini";
 
     if (!fs::exists(iniPath)) return;
-
     const CodecOption& selCodec = AVAILABLE_CODECS[codecIndex];
     std::vector<std::string> lines;
     std::ifstream inFile(iniPath);
@@ -668,7 +678,6 @@ void ModifyBasicIni(int width, int height, int fps, int codecIndex) {
     std::string sRes = std::to_string(width) + "x" + std::to_string(height);
     std::string sFps = std::to_string(fps);
     int idToWrite = (selCodec.id == 1) ? 9999 : selCodec.obsId;
-
     if (inFile.is_open()) {
         while (std::getline(inFile, line)) {
             if (line.find("RescaleRes=") == 0) line = "RescaleRes=" + sRes;
@@ -697,7 +706,6 @@ void ReadConfigSettings(int& width, int& height, int& fps, int& codecId) {
     wchar_t buffer[MAX_PATH];
     GetModuleFileNameW(NULL, buffer, MAX_PATH);
     fs::path iniPath = fs::path(buffer).parent_path() / "config" / "obs-studio" / "basic" / "profiles" / "Untitled" / "basic.ini";
-
     // Defaults
     width = 1920; height = 1080; fps = 60; codecId = 0;
     int encoderId = 27;
@@ -706,18 +714,27 @@ void ReadConfigSettings(int& width, int& height, int& fps, int& codecId) {
     if (inFile.is_open()) {
         std::string line;
         while (std::getline(inFile, line)) {
-            if (line.find("BaseCX=") == 0) try { width = std::stoi(line.substr(7)); }
+            if (line.find("BaseCX=") == 0) try {
+                width = std::stoi(line.substr(7));
+            }
             catch (...) {}
-            else if (line.find("BaseCY=") == 0) try { height = std::stoi(line.substr(7)); }
+            else if (line.find("BaseCY=") == 0) try {
+                height = std::stoi(line.substr(7));
+            }
             catch (...) {}
-            else if (line.find("FPSNum=") == 0) try { fps = std::stoi(line.substr(7)); }
+            else if (line.find("FPSNum=") == 0) try {
+                fps = std::stoi(line.substr(7));
+            }
             catch (...) {}
-            else if (line.find("FFVEncoderId=") == 0) try { encoderId = std::stoi(line.substr(13)); }
+            else if (line.find("FFVEncoderId=") == 0) try {
+                encoderId = std::stoi(line.substr(13));
+            }
             catch (...) {}
         }
     }
 
-    if (encoderId == 9999) codecId = 1; // Raw
+    if (encoderId == 9999) codecId = 1;
+    // Raw
     else codecId = 0; // OBS
 }
 
@@ -744,7 +761,6 @@ void LaunchOBS() {
     fs::path obsExePath = exeDir / "obs-studio" / "bin" / "64bit" / "obs64.exe";
 
     if (!fs::exists(obsExePath)) return;
-
     if (!g_hJob) {
         g_hJob = CreateJobObject(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
@@ -753,10 +769,8 @@ void LaunchOBS() {
     }
 
     std::wstring cmdLine = L"\"" + obsExePath.wstring() + L"\" --portable --profile \"Untitled\" --collection \"Untitled\" --startrecording --minimize-to-tray";
-
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
-
     if (CreateProcessW(nullptr, &cmdLine[0], nullptr, nullptr, FALSE, 0, nullptr, obsExePath.parent_path().c_str(), &si, &pi)) {
         if (g_hJob) AssignProcessToJobObject(g_hJob, pi.hProcess);
         CloseHandle(pi.hProcess);
@@ -778,10 +792,8 @@ void RunDXGICaptureLoop(D3DRenderer* renderer) {
     if (targetW < 100) targetW = 1280;
     if (targetH < 100) targetH = 720;
     if (targetFps < 1) targetFps = 30;
-
     LogToGUI("Starting DXGI Capture: Target " + std::to_string(targetW) + "x" + std::to_string(targetH) +
         " @ " + std::to_string(targetFps) + " FPS");
-
     // Инициализация захвата
     ID3D11Device* device = renderer->GetDevice();
     ComPtr<IDXGIDevice> dxgiDevice;
@@ -794,7 +806,6 @@ void RunDXGICaptureLoop(D3DRenderer* renderer) {
     output.As(&output1);
     ComPtr<IDXGIOutputDuplication> duplication;
     HRESULT hr = output1->DuplicateOutput(device, &duplication);
-
     if (FAILED(hr)) {
         LogToGUI("Failed to DuplicateOutput. Make sure OBS is not blocking it.");
         return;
@@ -805,7 +816,6 @@ void RunDXGICaptureLoop(D3DRenderer* renderer) {
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     ComPtr<IDXGIResource> desktopResource;
     ComPtr<ID3D11Texture2D> frameTexture;
-
     // Таймер для ограничения FPS
     using namespace std::chrono;
     auto frameInterval = microseconds(1000000 / targetFps);
@@ -833,7 +843,6 @@ void RunDXGICaptureLoop(D3DRenderer* renderer) {
         }
 
         desktopResource.As(&frameTexture);
-
         if (frameTexture) {
             // Вызываем рендер с указанием целевого разрешения!
             // Рендер сам сделает GPU Downscale, если размер не совпадает.
@@ -851,7 +860,13 @@ int ReadPacket(void* opaque, uint8_t* buf, int buf_size) {
     DWORD bytesRead = 0;
     if (!ReadFile(ctx->hPipe, buf, buf_size, &bytesRead, NULL)) return AVERROR_EOF;
     if (bytesRead == 0) return AVERROR_EOF;
-    SendUdpData(buf, bytesRead);
+
+    // В режиме OBS отправка идет напрямую из потока данных
+    // Проверяем флаг g_IsStreamNetwork
+    if (g_IsStreamNetwork) {
+        SendUdpData(buf, bytesRead);
+    }
+
     return bytesRead;
 }
 
@@ -884,10 +899,8 @@ void RunFFmpegLoop(D3DRenderer* renderer) {
 
     std::thread obsThread(LaunchOBS);
     obsThread.detach();
-
     if (!ConnectNamedPipe(hPipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) { CloseHandle(hPipe); return; }
     PostMessage(g_hMainWindow, WM_OBS_STARTED, 0, 0);
-
     size_t ioBufferSize = 32 * 1024;
     unsigned char* ioBuffer = (unsigned char*)av_malloc(ioBufferSize + AV_INPUT_BUFFER_PADDING_SIZE);
     ReaderCtx ctx = { hPipe };
@@ -900,19 +913,18 @@ void RunFFmpegLoop(D3DRenderer* renderer) {
     av_dict_set(&options, "analyzeduration", "0", 0);
     av_dict_set(&options, "fflags", "nobuffer", 0);
     av_dict_set(&options, "flags", "low_delay", 0);
-
     const AVInputFormat* in_fmt = av_find_input_format("nut");
     if (avformat_open_input(&fmtCtx, nullptr, in_fmt, &options) < 0) { CloseHandle(hPipe); return; }
     av_dict_free(&options);
-
     int videoStreamIdx = av_find_best_stream(fmtCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (videoStreamIdx < 0) { CloseHandle(hPipe); return; }
+    if (videoStreamIdx < 0) {
+        CloseHandle(hPipe); return;
+    }
 
     AVCodecParameters* codecPar = fmtCtx->streams[videoStreamIdx]->codecpar;
     const AVCodec* decoder = avcodec_find_decoder(codecPar->codec_id);
     AVCodecContext* decCtx = avcodec_alloc_context3(decoder);
     avcodec_parameters_to_context(decCtx, codecPar);
-
     AVBufferRef* hwDeviceRef = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
     if (hwDeviceRef) {
         AVHWDeviceContext* deviceCtx = (AVHWDeviceContext*)hwDeviceRef->data;
@@ -930,7 +942,6 @@ void RunFFmpegLoop(D3DRenderer* renderer) {
 
     PacketQueue packetQueue;
     std::thread readerThread(RunPacketReaderThread, fmtCtx, &packetQueue, videoStreamIdx);
-
     AVFrame* frame = av_frame_alloc();
     bool finished = false;
 
@@ -960,7 +971,6 @@ void RunFFmpegLoop(D3DRenderer* renderer) {
 void DecoderManagerThread(D3DRenderer* renderer) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     av_log_set_level(AV_LOG_ERROR);
-
     while (g_Running) {
         g_RestartRequested = false;
 
@@ -992,44 +1002,66 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     switch (uMsg) {
     case WM_CREATE:
     {
+        // Инициализируем глобальный хендл сразу
+        g_hMainWindow = hwnd;
+
         CreateWindowA("STATIC", "Res (WxH):", WS_VISIBLE | WS_CHILD, 20, 15, 80, 20, hwnd, NULL, NULL, NULL);
         g_hEditRes = CreateWindowA("EDIT", "1280x720", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 100, 15, 100, 25, hwnd, (HMENU)ID_EDIT_RES, NULL, NULL);
         CreateWindowA("STATIC", "FPS:", WS_VISIBLE | WS_CHILD, 220, 15, 40, 20, hwnd, NULL, NULL, NULL);
         g_hComboFps = CreateWindowA("COMBOBOX", "", WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 260, 15, 60, 200, hwnd, (HMENU)ID_COMBO_FPS, NULL, NULL);
         for (int fps : AVAILABLE_FPS) SendMessageA(g_hComboFps, CB_ADDSTRING, 0, (LPARAM)std::to_string(fps).c_str());
-        SendMessage(g_hComboFps, CB_SETCURSEL, 3, 0); // 60 default
+        SendMessage(g_hComboFps, CB_SETCURSEL, 3, 0);
+        // 60 default
         CreateWindowA("STATIC", "Mode:", WS_VISIBLE | WS_CHILD, 330, 15, 50, 20, hwnd, NULL, NULL, NULL);
         g_hComboCodec = CreateWindowA("COMBOBOX", "", WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 380, 15, 200, 200, hwnd, (HMENU)ID_COMBO_CODEC, NULL, NULL);
         for (const auto& c : AVAILABLE_CODECS) SendMessageA(g_hComboCodec, CB_ADDSTRING, 0, (LPARAM)c.name.c_str());
 
+        // ТУМБЛЕРЫ (Checkboxes)
+        // Show Stream (по дефолту выкл)
+        g_hChkShow = CreateWindowA("BUTTON", "Show Stream", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 600, 5, 110, 20, hwnd, (HMENU)ID_CHK_SHOW, NULL, NULL);
+        SendMessage(g_hChkShow, BM_SETCHECK, BST_UNCHECKED, 0);
+
+        // Stream Network (по дефолту выкл)
+        g_hChkStream = CreateWindowA("BUTTON", "Stream UDP", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 600, 30, 110, 20, hwnd, (HMENU)ID_CHK_STREAM, NULL, NULL);
+        SendMessage(g_hChkStream, BM_SETCHECK, BST_UNCHECKED, 0);
+
+
         int w, h, fps, codec;
         ReadConfigSettings(w, h, fps, codec);
-
         // Восстановление GUI из файла
         std::string resStr = std::to_string(w) + "x" + std::to_string(h);
         SetWindowTextA(g_hEditRes, resStr.c_str());
 
         // Найти FPS в списке
         for (int i = 0; i < AVAILABLE_FPS.size(); i++) {
-            if (AVAILABLE_FPS[i] == fps) { SendMessage(g_hComboFps, CB_SETCURSEL, i, 0); break; }
+            if (AVAILABLE_FPS[i] == fps) {
+                SendMessage(g_hComboFps, CB_SETCURSEL, i, 0);
+                break;
+            }
         }
         SendMessage(g_hComboCodec, CB_SETCURSEL, (codec == 1) ? 1 : 0, 0);
-
-        g_hBtnApply = CreateWindowA("BUTTON", "Apply & Restart", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 600, 15, 150, 25, hwnd, (HMENU)ID_BTN_APPLY, NULL, NULL);
+        g_hBtnApply = CreateWindowA("BUTTON", "Apply & Restart", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 720, 15, 120, 25, hwnd, (HMENU)ID_BTN_APPLY, NULL, NULL);
         g_hConsoleWindow = CreateWindowA("EDIT", "", WS_VISIBLE | WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, TOP_PANEL_HEIGHT, WINDOW_WIDTH - 16, CONSOLE_HEIGHT, hwnd, (HMENU)ID_CONSOLE_BOX, NULL, NULL);
         g_hVideoWindow = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_BLACKFRAME, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
-
         LogToGUI("System initialized. UDP Port: " + std::to_string(UDP_PORT));
+
+        // ИСПРАВЛЕНИЕ: Сразу применяем лейаут, чтобы окно видео не было 0х0 при старте
+        UpdateVideoLayout(w, h);
     }
     return 0;
-
     case WM_OBS_STARTED:
         LogToGUI("Stream Active.");
         if (g_hBtnApply) EnableWindow(g_hBtnApply, TRUE);
         return 0;
-
     case WM_COMMAND:
-        if (LOWORD(wParam) == ID_BTN_APPLY) {
+        // Обработка чекбоксов
+        if (LOWORD(wParam) == ID_CHK_SHOW) {
+            g_IsShowStream = (SendMessage(g_hChkShow, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        }
+        else if (LOWORD(wParam) == ID_CHK_STREAM) {
+            g_IsStreamNetwork = (SendMessage(g_hChkStream, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        }
+        else if (LOWORD(wParam) == ID_BTN_APPLY) {
             if (g_RestartRequested) return 0;
             char bufRes[64];
             GetWindowTextA(g_hEditRes, bufRes, 64);
@@ -1040,7 +1072,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
             int w = 0, h = 0;
             if (sscanf(bufRes, "%dx%d", &w, &h) != 2 || w <= 0 || w >= 10000 || h <= 0) {
-                LogToGUI("Invalid resolution!"); return 0;
+                LogToGUI("Invalid resolution!");
+                return 0;
             }
 
             if (codecIdx < 0) codecIdx = 0;
@@ -1049,10 +1082,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             UpdateVideoLayout(w, h);
             ModifyBasicIni(w, h, fps, codecIdx);
             g_RestartRequested = true;
-            if (g_hJob) { CloseHandle(g_hJob); g_hJob = nullptr; }
+            if (g_hJob) {
+                CloseHandle(g_hJob); g_hJob = nullptr;
+            }
         }
         return 0;
-
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1072,7 +1106,6 @@ int main() {
     int scrW = GetSystemMetrics(SM_CXSCREEN);
     int scrH = GetSystemMetrics(SM_CYSCREEN);
     g_hMainWindow = CreateWindowExW(0, L"OBSReceiverHub", L"OBS Stream Control Panel", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE, (scrW - WINDOW_WIDTH) / 2, (scrH - WINDOW_HEIGHT) / 2, WINDOW_WIDTH, WINDOW_HEIGHT, nullptr, nullptr, nullptr, nullptr);
-
     D3DRenderer renderer(g_hVideoWindow, g_hMainWindow);
     std::thread t(DecoderManagerThread, &renderer);
 
